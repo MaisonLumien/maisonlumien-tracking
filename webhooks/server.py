@@ -1,5 +1,5 @@
 """
-SERVIDOR WEBHOOK PARA MAISONLUMIEN - VERSIÓN SQLITE PARA RENDER
+SERVIDOR WEBHOOK PARA MAISONLUMIEN - VERSIÓN COMPLETA CON CONSULTAS
 """
 
 import sys
@@ -8,7 +8,7 @@ import json
 import logging
 import uuid
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, redirect, make_response
 
 # Configurar logging para Render
@@ -136,7 +136,7 @@ def save_tracking_event(customer_id, campaign_id, event_type,
 
 
 # ============================================
-# ENDPOINTS
+# ENDPOINTS DE TRACKING
 # ============================================
 @app.route('/track/click', methods=['GET'])
 def track_click():
@@ -225,6 +225,273 @@ def track_open():
         return "", 204
 
 
+# ============================================
+# ENDPOINTS DE CONSULTA (PARA VER LOS DATOS)
+# ============================================
+@app.route('/webhook/events', methods=['GET'])
+def get_events():
+    """Obtiene los últimos 50 eventos con todos los detalles"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'No se pudo conectar a la BD'}), 500
+        
+        # Obtener parámetros de filtro
+        customer_id = request.args.get('customer_id')
+        campaign_id = request.args.get('campaign_id')
+        event_type = request.args.get('event_type')
+        limit = int(request.args.get('limit', 50))
+        
+        cursor = conn.cursor()
+        
+        # Construir consulta con filtros
+        query = '''
+            SELECT 
+                id,
+                customer_id_text,
+                campaign_id,
+                event_type,
+                event_timestamp,
+                ip_address,
+                user_agent,
+                link_url,
+                metadata
+            FROM email_events
+            WHERE 1=1
+        '''
+        params = []
+        
+        if customer_id:
+            query += ' AND customer_id_text = ?'
+            params.append(customer_id)
+        if campaign_id:
+            query += ' AND campaign_id = ?'
+            params.append(campaign_id)
+        if event_type:
+            query += ' AND event_type = ?'
+            params.append(event_type)
+        
+        query += ' ORDER BY event_timestamp DESC LIMIT ?'
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        
+        events = []
+        for row in cursor.fetchall():
+            events.append({
+                'id': row[0],
+                'customer_id': row[1],
+                'campaign': row[2],
+                'event_type': row[3],
+                'timestamp': row[4],
+                'ip': row[5],
+                'user_agent': row[6][:100] + '...' if row[6] and len(row[6]) > 100 else row[6],
+                'link_url': row[7],
+                'metadata': json.loads(row[8]) if row[8] else None
+            })
+        
+        conn.close()
+        return jsonify({
+            'total': len(events),
+            'filters': {
+                'customer_id': customer_id,
+                'campaign_id': campaign_id,
+                'event_type': event_type,
+                'limit': limit
+            },
+            'events': events
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo eventos: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/webhook/stats', methods=['GET'])
+def get_stats():
+    """Obtiene estadísticas completas"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'No se pudo conectar a la BD'}), 500
+        
+        cursor = conn.cursor()
+        
+        # Total de eventos
+        cursor.execute('SELECT COUNT(*) FROM email_events')
+        total = cursor.fetchone()[0]
+        
+        # Eventos por tipo
+        cursor.execute('''
+            SELECT event_type, COUNT(*) as count 
+            FROM email_events 
+            GROUP BY event_type
+        ''')
+        by_type = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Eventos por campaña
+        cursor.execute('''
+            SELECT campaign_id, COUNT(*) as count 
+            FROM email_events 
+            GROUP BY campaign_id
+            ORDER BY count DESC
+        ''')
+        by_campaign = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Eventos por día (últimos 7 días)
+        cursor.execute('''
+            SELECT 
+                DATE(event_timestamp) as date,
+                COUNT(*) as count
+            FROM email_events
+            WHERE event_timestamp >= DATE('now', '-7 days')
+            GROUP BY DATE(event_timestamp)
+            ORDER BY date DESC
+        ''')
+        by_day = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Clientes más activos
+        cursor.execute('''
+            SELECT 
+                customer_id_text,
+                COUNT(*) as count
+            FROM email_events
+            WHERE customer_id_text IS NOT NULL
+            GROUP BY customer_id_text
+            ORDER BY count DESC
+            LIMIT 10
+        ''')
+        top_customers = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        conn.close()
+        
+        return jsonify({
+            'total_events': total,
+            'by_type': by_type,
+            'by_campaign': by_campaign,
+            'by_day': by_day,
+            'top_customers': top_customers,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo estadísticas: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/webhook/customer/<customer_id>', methods=['GET'])
+def get_customer_events(customer_id):
+    """Obtiene todos los eventos de un cliente específico"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'No se pudo conectar a la BD'}), 500
+        
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                id,
+                campaign_id,
+                event_type,
+                event_timestamp,
+                ip_address,
+                link_url
+            FROM email_events
+            WHERE customer_id_text = ?
+            ORDER BY event_timestamp DESC
+        ''', (customer_id,))
+        
+        events = []
+        for row in cursor.fetchall():
+            events.append({
+                'id': row[0],
+                'campaign': row[1],
+                'event_type': row[2],
+                'timestamp': row[3],
+                'ip': row[4],
+                'link_url': row[5]
+            })
+        
+        conn.close()
+        return jsonify({
+            'customer_id': customer_id,
+            'total': len(events),
+            'events': events
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo eventos del cliente: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/webhook/campaign/<campaign_id>', methods=['GET'])
+def get_campaign_stats(campaign_id):
+    """Obtiene estadísticas de una campaña específica"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'No se pudo conectar a la BD'}), 500
+        
+        cursor = conn.cursor()
+        
+        # Total por tipo
+        cursor.execute('''
+            SELECT event_type, COUNT(*) as count
+            FROM email_events
+            WHERE campaign_id = ?
+            GROUP BY event_type
+        ''', (campaign_id,))
+        by_type = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Total general
+        cursor.execute('SELECT COUNT(*) FROM email_events WHERE campaign_id = ?', (campaign_id,))
+        total = cursor.fetchone()[0]
+        
+        # Clientes únicos
+        cursor.execute('''
+            SELECT COUNT(DISTINCT customer_id_text)
+            FROM email_events
+            WHERE campaign_id = ? AND customer_id_text IS NOT NULL
+        ''', (campaign_id,))
+        unique_customers = cursor.fetchone()[0]
+        
+        # Últimos eventos
+        cursor.execute('''
+            SELECT 
+                customer_id_text,
+                event_type,
+                event_timestamp
+            FROM email_events
+            WHERE campaign_id = ?
+            ORDER BY event_timestamp DESC
+            LIMIT 10
+        ''', (campaign_id,))
+        recent = []
+        for row in cursor.fetchall():
+            recent.append({
+                'customer_id': row[0],
+                'event_type': row[1],
+                'timestamp': row[2]
+            })
+        
+        conn.close()
+        
+        return jsonify({
+            'campaign_id': campaign_id,
+            'total_events': total,
+            'unique_customers': unique_customers,
+            'by_type': by_type,
+            'recent_events': recent
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo estadísticas de campaña: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# WEBHOOKS EXTERNOS
+# ============================================
 @app.route('/webhook/shopify/order', methods=['POST'])
 def shopify_order_webhook():
     """Webhook de Shopify - Registra compras"""
@@ -302,13 +569,16 @@ def mailgun_webhook():
         return "Error", 500
 
 
+# ============================================
+# ENDPOINTS DE SALUD Y TEST
+# ============================================
 @app.route('/webhook/health', methods=['GET'])
 def health_check():
     """Health check para Render"""
     return jsonify({
         'status': 'ok',
         'service': 'MaisonLumien Tracking System',
-        'version': 'v1.0 - SQLite',
+        'version': 'v2.0 - Completo',
         'database': 'SQLite',
         'db_path': DB_PATH,
         'timestamp': datetime.now().isoformat()
@@ -323,52 +593,6 @@ def test_webhook():
     }), 200
 
 
-@app.route('/webhook/stats', methods=['GET'])
-def get_stats():
-    """Obtiene estadísticas de la base de datos"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({'error': 'No se pudo conectar a la BD'}), 500
-        
-        cursor = conn.cursor()
-        
-        # Total de eventos
-        cursor.execute('SELECT COUNT(*) FROM email_events')
-        total = cursor.fetchone()[0]
-        
-        # Eventos por tipo
-        cursor.execute('''
-            SELECT event_type, COUNT(*) as count 
-            FROM email_events 
-            GROUP BY event_type
-        ''')
-        by_type = {row[0]: row[1] for row in cursor.fetchall()}
-        
-        # Eventos por campaña
-        cursor.execute('''
-            SELECT campaign_id, COUNT(*) as count 
-            FROM email_events 
-            GROUP BY campaign_id
-            ORDER BY count DESC
-            LIMIT 10
-        ''')
-        by_campaign = {row[0]: row[1] for row in cursor.fetchall()}
-        
-        conn.close()
-        
-        return jsonify({
-            'total_events': total,
-            'by_type': by_type,
-            'by_campaign': by_campaign,
-            'timestamp': datetime.now().isoformat()
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo estadísticas: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
 # ============================================
 # RUTA PRINCIPAL
 # ============================================
@@ -377,33 +601,51 @@ def home():
     return jsonify({
         'service': 'MaisonLumien Tracking System',
         'status': 'online',
-        'version': 'v1.0 - SQLite',
+        'version': 'v2.0 - Completo',
         'database': 'SQLite',
         'endpoints': {
-            'track_click': '/track/click?customer_id=xxx&url=xxx',
-            'track_open': '/track/open?customer_id=xxx',
-            'webhook_shopify': '/webhook/shopify/order',
-            'webhook_mailgun': '/webhook/mailgun',
-            'health': '/webhook/health',
-            'stats': '/webhook/stats',
-            'test': '/webhook/test'
+            'tracking': {
+                'click': '/track/click?customer_id=xxx&url=xxx',
+                'open': '/track/open?customer_id=xxx'
+            },
+            'consultas': {
+                'eventos': '/webhook/events?customer_id=xxx&limit=50',
+                'estadisticas': '/webhook/stats',
+                'cliente': '/webhook/customer/[customer_id]',
+                'campaña': '/webhook/campaign/[campaign_id]'
+            },
+            'webhooks': {
+                'shopify': '/webhook/shopify/order (POST)',
+                'mailgun': '/webhook/mailgun (POST)'
+            },
+            'salud': {
+                'health': '/webhook/health',
+                'test': '/webhook/test'
+            }
         }
     }), 200
 
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("  MAISONLUMIEN - TRACKING SYSTEM (SQLite)")
+    print("  MAISONLUMIEN - TRACKING SYSTEM (v2.0 - Completo)")
     print("=" * 60)
     print(f"\n🚀 Servidor iniciado en puerto {PORT}")
     print(f"📁 Base de datos: {DB_PATH}")
     print("\n📡 Endpoints disponibles:")
+    print("   TRACKING:")
     print("   GET  /track/click     → Tracking de clics")
     print("   GET  /track/open      → Tracking de aperturas")
+    print("   CONSULTAS:")
+    print("   GET  /webhook/events  → Ver eventos (filtros)")
+    print("   GET  /webhook/stats   → Estadísticas completas")
+    print("   GET  /webhook/customer/[id] → Eventos por cliente")
+    print("   GET  /webhook/campaign/[id] → Estadísticas por campaña")
+    print("   WEBHOOKS:")
     print("   POST /webhook/shopify → Webhook de Shopify")
     print("   POST /webhook/mailgun → Webhook de Mailgun")
+    print("   SALUD:")
     print("   GET  /webhook/health  → Health check")
-    print("   GET  /webhook/stats   → Estadísticas")
     print("   GET  /webhook/test    → Test")
     print("=" * 60)
     
